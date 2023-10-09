@@ -1,209 +1,202 @@
-import requests
+package ksuid
 
-count=0
-def remove_empty_lines(text: str):
-    lines = text.split('\n')
-    non_empty_lines = [line for line in lines if line.strip() != '']
-    cleaned_text = '\n'.join(non_empty_lines)
-    return cleaned_text
+import (
+	"encoding/binary"
+	"errors"
+)
 
+const (
+	// lexographic ordering (based on Unicode table) is 0-9A-Za-z
+	base62Characters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	zeroString       = "000000000000000000000000000"
+	offsetUppercase  = 10
+	offsetLowercase  = 36
+)
 
-# def split_code_into_chunks(code: str):
-#     try:
-#         code = remove_empty_lines(code)
-#         lines = code.split('\n')
-#         chunks = []
-#         current_chunk = []
-#         inside_class = False  # Flag to track if we are currently inside a class definition
+var (
+	errShortBuffer = errors.New("the output buffer is too small to hold to decoded value")
+)
 
-#         for line in lines:
-#             if line.startswith('class') or line.startswith('async class'):
-#                 if current_chunk:
-#                     chunks.append(current_chunk)
-#                     current_chunk = []
-#                 inside_class = True
-#                 current_chunk.append(line)
+// Converts a base 62 byte into the number value that it represents.
+func base62Value(digit byte) byte {
+	switch {
+	case digit >= '0' && digit <= '9':
+		return digit - '0'
+	case digit >= 'A' && digit <= 'Z':
+		return offsetUppercase + (digit - 'A')
+	default:
+		return offsetLowercase + (digit - 'a')
+	}
+}
 
-#             elif line.startswith('def') or line.startswith('async def'):
-#                 if current_chunk and not inside_class:
-#                     chunks.append(current_chunk)
-#                     current_chunk = []
-#                 inside_class = False
-#                 current_chunk.append(line)
+// This function encodes the base 62 representation of the src KSUID in binary
+// form into dst.
+//
+// In order to support a couple of optimizations the function assumes that src
+// is 20 bytes long and dst is 27 bytes long.
+//
+// Any unused bytes in dst will be set to the padding '0' byte.
+func fastEncodeBase62(dst []byte, src []byte) {
+	const srcBase = 4294967296
+	const dstBase = 62
 
-#             elif line.startswith('#') or line.startswith('@'):
-#                 continue
+	// Split src into 5 4-byte words, this is where most of the efficiency comes
+	// from because this is a O(N^2) algorithm, and we make N = N / 4 by working
+	// on 32 bits at a time.
+	parts := [5]uint32{
+		binary.BigEndian.Uint32(src[0:4]),
+		binary.BigEndian.Uint32(src[4:8]),
+		binary.BigEndian.Uint32(src[8:12]),
+		binary.BigEndian.Uint32(src[12:16]),
+		binary.BigEndian.Uint32(src[16:20]),
+	}
 
-#             elif line.startswith("import ") or line.startswith("from "):
-#                 continue
-#             else:
-#                 inside_class = False
-#                 # inside_imports = False
-#                 current_chunk.append(line)
+	n := len(dst)
+	bp := parts[:]
+	bq := [5]uint32{}
 
-#             # Check if the class definition has ended to reset the flag
-#             if inside_class and line.strip().endswith(':'):
-#                 inside_class = False
+	for len(bp) != 0 {
+		quotient := bq[:0]
+		remainder := uint64(0)
 
-#         if current_chunk:
-#             chunks.append(current_chunk)
+		for _, c := range bp {
+			value := uint64(c) + uint64(remainder)*srcBase
+			digit := value / dstBase
+			remainder = value % dstBase
 
-#         non_empty_lists = [sublist for sublist in chunks if any(item.strip() != '' for item in sublist)]
-#         return non_empty_lists
-#     except Exception as e:
-#         print(f"An error occurred in split_code_into_chunks: {e}")
-#         return []
+			if len(quotient) != 0 || digit != 0 {
+				quotient = append(quotient, uint32(digit))
+			}
+		}
 
+		// Writes at the end of the destination buffer because we computed the
+		// lowest bits first.
+		n--
+		dst[n] = base62Characters[remainder]
+		bp = quotient
+	}
 
-# def create_two_chunks(code_chunks):
-#     result = []
-#     current_chunk = []
-#     inside = False
-#     for line in code_chunks:
-#         if line.startswith("def") or line.startswith("class") or line.startswith("async def ") or line.startswith(
-#                 "async class "):
-#             inside = True
-#             if current_chunk:
-#                 result.append(current_chunk)
-#             current_chunk = [line]
-#         elif line.startswith(' ') and inside == True:
-#             current_chunk.append(line)
-#         else:
-#             if current_chunk:
-#                 inside = False
-#                 result.append(current_chunk)
-#             current_chunk = []
-#     if current_chunk:
-#         result.append(current_chunk)
-#     return result
+	// Add padding at the head of the destination buffer for all bytes that were
+	// not set.
+	copy(dst[:n], zeroString)
+}
 
-def split_code_into_chunks(code):
-    try:
-        lines = code.split('\n')
-        chunks = []
-        current_chunk = []
+// This function appends the base 62 representation of the KSUID in src to dst,
+// and returns the extended byte slice.
+// The result is left-padded with '0' bytes to always append 27 bytes to the
+// destination buffer.
+func fastAppendEncodeBase62(dst []byte, src []byte) []byte {
+	dst = reserve(dst, stringEncodedLength)
+	n := len(dst)
+	fastEncodeBase62(dst[n:n+stringEncodedLength], src)
+	return dst[:n+stringEncodedLength]
+}
 
-        inside_function = False
+// This function decodes the base 62 representation of the src KSUID to the
+// binary form into dst.
+//
+// In order to support a couple of optimizations the function assumes that src
+// is 27 bytes long and dst is 20 bytes long.
+//
+// Any unused bytes in dst will be set to zero.
+func fastDecodeBase62(dst []byte, src []byte) error {
+	const srcBase = 62
+	const dstBase = 4294967296
 
-        for line in lines:
-            # Check for function declaration
-            if line.strip().startswith('func '):
-                if inside_function:
-                    chunks.append(current_chunk)
-                current_chunk = [line]
-                inside_function = True
-            elif inside_function:
-                # Check for the end of a function
-                if line.strip().endswith('}') and not line.strip().startswith('}'):
-                    inside_function = False
-                current_chunk.append(line)
+	// This line helps BCE (Bounds Check Elimination).
+	// It may be safely removed.
+	_ = src[26]
 
-        # Append the last chunk if not empty
-        if current_chunk:
-            chunks.append(current_chunk)
+	parts := [27]byte{
+		base62Value(src[0]),
+		base62Value(src[1]),
+		base62Value(src[2]),
+		base62Value(src[3]),
+		base62Value(src[4]),
+		base62Value(src[5]),
+		base62Value(src[6]),
+		base62Value(src[7]),
+		base62Value(src[8]),
+		base62Value(src[9]),
 
-        # Remove empty and whitespace-only lines from chunks
-        non_empty_lists = [sublist for sublist in chunks if any(item.strip() != '' for item in sublist)]
-        return non_empty_lists
+		base62Value(src[10]),
+		base62Value(src[11]),
+		base62Value(src[12]),
+		base62Value(src[13]),
+		base62Value(src[14]),
+		base62Value(src[15]),
+		base62Value(src[16]),
+		base62Value(src[17]),
+		base62Value(src[18]),
+		base62Value(src[19]),
 
-    except Exception as e:
-        print(f"An error occurred in split_code_into_chunks: {e}")
-        return []
+		base62Value(src[20]),
+		base62Value(src[21]),
+		base62Value(src[22]),
+		base62Value(src[23]),
+		base62Value(src[24]),
+		base62Value(src[25]),
+		base62Value(src[26]),
+	}
 
+	n := len(dst)
+	bp := parts[:]
+	bq := [stringEncodedLength]byte{}
 
-# access_token = "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"
+	for len(bp) > 0 {
+		quotient := bq[:0]
+		remainder := uint64(0)
 
+		for _, c := range bp {
+			value := uint64(c) + uint64(remainder)*srcBase
+			digit := value / dstBase
+			remainder = value % dstBase
 
-def get_branches(username, repository):
-    api_url = f"https://api.github.com/repos/{username}/{repository}/branches"
-    print(api_url)
-    response = requests.get(api_url)
+			if len(quotient) != 0 || digit != 0 {
+				quotient = append(quotient, byte(digit))
+			}
+		}
 
-    if response.status_code == 200:
-        branches = [branch['name'] for branch in response.json()]
-        return branches
-    else:
-        print("Failed to fetch repository branches.")
-        return []
+		if n < 4 {
+			return errShortBuffer
+		}
 
+		dst[n-4] = byte(remainder >> 24)
+		dst[n-3] = byte(remainder >> 16)
+		dst[n-2] = byte(remainder >> 8)
+		dst[n-1] = byte(remainder)
+		n -= 4
+		bp = quotient
+	}
 
-def get_repository_files(username, repository, branch):
-    api_url = f"https://api.github.com/repos/{username}/{repository}/contents?ref={branch}"
-    print(api_url)
-    response = requests.get(api_url)
-    print(response)
-    if response.status_code == 200:
-        contents = response.json()
-        all_code_content = []
+	var zero [20]byte
+	copy(dst[:n], zero[:])
+	return nil
+}
 
-        def fetch_content_recursive(items):
-            for item in items:
-                if item['type'] == 'file' and item['name'].endswith('.go'):
-                    file_url = item['download_url']
-                    print(file_url)
-                    response = requests.get(file_url)
-                    if response.status_code == 200:
-                        content = response.text
-                        all_code_content.append(content)
-                    else:
-                        print(f"Failed to fetch content for {item['name']}")
-                elif item['type'] == 'dir':
-                    subdir_url = item['url']
-                    subdir_response = requests.get(subdir_url)
-                    if subdir_response.status_code == 200:
-                        subdir_contents = subdir_response.json()
-                        fetch_content_recursive(subdir_contents)
-                    else:
-                        print(f"Failed to fetch contents for subdirectory {item['name']}")
+// This function appends the base 62 decoded version of src into dst.
+func fastAppendDecodeBase62(dst []byte, src []byte) []byte {
+	dst = reserve(dst, byteLength)
+	n := len(dst)
+	fastDecodeBase62(dst[n:n+byteLength], src)
+	return dst[:n+byteLength]
+}
 
-        fetch_content_recursive(contents)
-        return all_code_content
-    else:
-        print("Failed to fetch repository contents.")
-        return []
+// Ensures that at least nbytes are available in the remaining capacity of the
+// destination slice, if not, a new copy is made and returned by the function.
+func reserve(dst []byte, nbytes int) []byte {
+	c := cap(dst)
+	n := len(dst)
 
+	if avail := c - n; avail < nbytes {
+		c *= 2
+		if (c - n) < nbytes {
+			c = n + nbytes
+		}
+		b := make([]byte, n, c)
+		copy(b, dst)
+		dst = b
+	}
 
-def main(username, repository, selected_branch):
-    global count
-    branches = get_branches(username, repository)
-
-    if selected_branch not in branches:
-        print("Invalid branch name. Please select from the available branches:", branches)
-        print(branches)
-
-    code_contents = get_repository_files(username, repository, selected_branch)
-    print(code_contents)
-    combined_chunks = []
-    code = []
-    for code_content in code_contents:
-        code.append(code_content.splitlines())
-        chunks = split_code_into_chunks(code_content)
-        print("chunks", chunks)
-        print(len(chunks))
-        count+=1
-        print(count)
-    #     for chunk in chunks:
-    #         if any(line.startswith("class") or line.startswith("def") for line in chunk):
-    #             codes = create_two_chunks(chunk)
-    #             print("codes", codes)
-    #             combined_chunks.extend(codes)
-    #     combined_chunks.extend(code)
-    # print("\nCombined Chunks:", combined_chunks)
-    # print("\nCombined Chunks:")
-    # for chunk in combined_chunks:
-    #     if isinstance(chunk, list):
-    #         print('chunk')
-    #         print("\n".join(chunk))
-    #     else:
-    #         print(chunk)
-    #     for idx, chunk in enumerate(chunks, start=1):
-    #         codes.append(chunk)
-    #         print(f"Chunk {idx}:\n")
-    #         print('\n'.join(chunk))
-    #         print("=" * 40)
-    # print(len(combined_chunks))
-    # return combined_chunks
-
-
-if __name__ == "__main__":
-    main("segmentio", "ksuid", "master")
+	return dst
+}
